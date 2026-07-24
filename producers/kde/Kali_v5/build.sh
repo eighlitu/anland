@@ -1,10 +1,14 @@
 #!/bin/bash
 #
-# build.sh — rebuild patched kwin and Xwayland .deb packages and install them.
+# build.sh — rebuild patched kwin and Xwayland .deb packages for Kali Linux.
 #
-# Run this INSIDE the container (e.g. `droidspaces -n kde run` or a shell there).
+# Run this INSIDE a Kali container (e.g. `docker run kalilinux/kali-rolling`).
 # It uses sudo for the privileged steps (apt / dpkg), so it works whether you
 # are root or an ordinary user with sudo rights.
+#
+# Kali is a rolling release based on Debian Testing, so it uses the same
+# DEB822-format .sources files as Debian 13 (Trixie). This script is adapted
+# from the Debian13_v5 build script with Kali-specific repository handling.
 #
 # The two patches fix hardware acceleration / input on the kgsl(turnip) stack:
 #   kwin.patch      -> src 'kwin'      (wayland backend coordinate scaling)
@@ -55,17 +59,27 @@ warn() { printf '\033[1;33m[warn] %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31m[error] %s\033[0m\n' "$*" >&2; exit 1; }
 
 # ---- ensure deb-src entries exist so `apt source` works --------------------
+# Kali uses DEB822-format .sources files by default (same as Debian 13 Trixie)
 ensure_deb_src() {
-    if ! $SUDO grep -rqsE '^Types:.*deb-src|^deb-src ' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
-        log "Enabling deb-src repositories"
-        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            $SUDO sed -i 's/^Types: deb$/Types: deb deb-src/' \
-                /etc/apt/sources.list.d/ubuntu.sources
-        elif [ -f /etc/apt/sources.list ]; then
+    # Check for Kali's DEB822-format sources
+    local kali_sources="/etc/apt/sources.list.d/kali.sources"
+
+    if [ -f "$kali_sources" ]; then
+        if ! grep -qs 'deb-src' "$kali_sources"; then
+            log "Enabling deb-src in Kali .sources (DEB822 format)"
+            $SUDO sed -i 's/^Types: deb$/Types: deb deb-src/' "$kali_sources"
+        fi
+    fi
+
+    # Also check traditional sources.list (some Kali installations still use it)
+    if [ -f /etc/apt/sources.list ]; then
+        if ! $SUDO grep -rqsE '^Types:.*deb-src|^deb-src ' \
+                /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+            log "Enabling deb-src in traditional sources.list"
             $SUDO sed -i 's/^deb \(.*\)$/deb \1\ndeb-src \1/' /etc/apt/sources.list
         fi
     fi
+
     $SUDO apt-get update -qq || warn "apt-get update reported issues"
 }
 
@@ -132,6 +146,7 @@ main() {
     log "kwin.patch     : $kwin_patch"
     log "xwayland.patch : $xwl_patch"
     log "work dir       : $WORKDIR"
+    log "target distro  : Kali Linux (rolling)"
 
     ensure_deb_src
 
@@ -142,7 +157,7 @@ main() {
 
     sed -i '/PULSE_SERVER=unix:\/tmp\/.pulse-socket/d' /etc/environment
 
-    log "Done. Patched kwin and Xwayland built and installed."
+    log "Done. Patched kwin and Xwayland built and installed for Kali Linux."
     echo "Built packages are under: $WORKDIR/{kwin,xwayland}/"
     echo "Restart the compositor session for the changes to take effect."
 }
