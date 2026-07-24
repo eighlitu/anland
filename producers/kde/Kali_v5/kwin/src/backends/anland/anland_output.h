@@ -5,15 +5,15 @@
     SPDX-License-Identifier: GPL-2.0-or-later
 
     Native output for the "anland" backend. The render cycle is paced by the
-    display daemon's eventfds, not a software timer: present() hands the buffer
-    to the consumer (render-done fence channel) and the consumer's buffer-ready signal
-    (buf_ready_efd) completes the frame — mirroring how the DRM backend completes
-    a frame on a page-flip event. This keeps KWin's compositing in lockstep with
-    the frontend instead of free-running on a vsync timer.
+    display daemon's transport, not a software timer: present() hands the buffer
+    to the consumer (a render-done message on the dedicated fence channel) and the
+    consumer's buffer-ready signal (buf_ready_efd) completes the frame — mirroring
+    how the DRM backend completes a frame on a page-flip event. This keeps KWin's
+    compositing in lockstep with the frontend instead of free-running on a vsync timer.
 */
 #pragma once
 
-#include "core/output.h"
+#include "core/backendoutput.h"
 
 #include <QObject>
 #include <memory>
@@ -27,7 +27,7 @@ class OutputFrame;
 class OutputLayer;
 class RenderLoop;
 
-class AnlandOutput : public Output
+class AnlandOutput : public BackendOutput
 {
     Q_OBJECT
 
@@ -36,7 +36,8 @@ public:
     ~AnlandOutput() override;
 
     RenderLoop *renderLoop() const override;
-    void present(const std::shared_ptr<OutputFrame> &frame);
+    bool testPresentation(const std::shared_ptr<OutputFrame> &frame) override;
+    bool present(const QList<OutputLayer *> &layersToUpdate, const std::shared_ptr<OutputFrame> &frame) override;
 
     /** @p pixelSize and @p refresh (in mHz) come from the display daemon. */
     void init(const QSize &pixelSize, int refresh, qreal scale);
@@ -55,7 +56,7 @@ public:
     /** Reconfigure the output when the consumer uses a different buffer size
      *  (e.g. screen rotation / resolution switch). Updates the OutputMode and asks
      *  the backend to emit outputsQueried() so the Workspace re-lays-out windows
-     *  for the new size. */
+     *  for the new size — currentModeChanged() alone does not trigger a relayout. */
     void resize(const QSize &newSize);
 
     /** Consumer went away (fallback): fail any in-flight frame and inhibit() the
@@ -84,7 +85,7 @@ private:
     AnlandEglLayer *m_eglLayer = nullptr;
     bool m_awaitingPresent = false;
     // Tracks our RenderLoop::inhibit() so inhibit/uninhibit stay balanced
-    // (uninhibit() asserts the count is > 0). See stopRendering()/resumeRendering().
+    // (uninhibit() asserts the count is > 0). See onConsumerLost()/resumeRendering().
     bool m_renderingInhibited = false;
 };
 

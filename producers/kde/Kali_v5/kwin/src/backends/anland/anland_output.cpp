@@ -17,7 +17,7 @@ namespace KWin
 {
 
 AnlandOutput::AnlandOutput(AnlandBackend *parent, const QString &name)
-    : Output(parent)
+    : BackendOutput()
     , m_backend(parent)
     , m_renderLoop(std::make_unique<RenderLoop>(this))
 {
@@ -38,13 +38,16 @@ RenderLoop *AnlandOutput::renderLoop() const
     return m_renderLoop.get();
 }
 
-void AnlandOutput::present(const std::shared_ptr<OutputFrame> &frame)
+bool AnlandOutput::testPresentation(const std::shared_ptr<OutputFrame> &frame)
+{
+    return true;
+}
+
+bool AnlandOutput::present(const QList<OutputLayer *> &layersToUpdate, const std::shared_ptr<OutputFrame> &frame)
 {
     // The scene has already been rendered into the daemon's dmabuf by the layer
     // (AnlandEglLayer::doEndFrame). Hand it to the consumer now.
     m_frame = frame;
-    Q_EMIT outputChange(frame->damage());
-
     const bool handedToConsumer = m_backend->notifyFramePresented();
     if (handedToConsumer) {
         // The consumer will present the buffer and then signal buffer-ready;
@@ -55,6 +58,7 @@ void AnlandOutput::present(const std::shared_ptr<OutputFrame> &frame)
         // arrive for it — complete it now so the RenderLoop never stalls.
         completeFrame();
     }
+    return true;
 }
 
 void AnlandOutput::init(const QSize &pixelSize, int refresh, qreal scale)
@@ -106,10 +110,6 @@ void AnlandOutput::completeFrame()
         return;
     }
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
-    // presented() -> RenderLoopPrivate::notifyFrameCompleted(): decrements the
-    // pending-frame count, delivers presentation feedback and schedules the next
-    // repaint through the standard path (the 6.x equivalent of the 5.27 backend's
-    // RenderLoopPrivate::notifyFrameCompleted()).
     m_frame->presented(now, PresentationMode::VSync);
     m_frame.reset();
 }
@@ -127,9 +127,8 @@ void AnlandOutput::onConsumerReady()
 
 void AnlandOutput::resize(const QSize &newSize)
 {
-    if (newSize == modeSize() || !newSize.isValid()) {
+    if (newSize == modeSize() || !newSize.isValid())
         return;
-    }
 
     qCInfo(KWIN_ANLAND) << "resizing output to" << newSize;
 
@@ -142,12 +141,15 @@ void AnlandOutput::resize(const QSize &newSize)
     next.currentMode = mode;
     setState(next);
 
-    // setState() only emits currentModeChanged(); Workspace recomputes geometry
-    // when OutputBackend::outputsQueried drives updateOutputs()/desktopResized().
+    // setState() only emits currentModeChanged(); that does NOT re-lay-out windows.
+    // The Workspace recomputes geometry in updateOutputs()/desktopResized(), which is
+    // driven by OutputBackend::outputsQueried (see Workspace ctor). Since we changed
+    // the mode directly here rather than through OutputConfiguration, emit it now so
+    // the compositor recalculates the layout for the new size.
     m_backend->notifyOutputsChanged();
 
-    // Invalidate any in-flight frame: the mode just changed, so the buffer that
-    // was being presented corresponds to a different layout.
+    // Invalidate any in-flight frame: the mode just changed, so the buffer that was
+    // being presented corresponds to a different layout.
     if (m_awaitingPresent) {
         m_awaitingPresent = false;
         m_frame.reset();
@@ -168,15 +170,9 @@ void AnlandOutput::stopRendering()
 {
     if (m_awaitingPresent) {
         m_awaitingPresent = false;
-        // No buffer-ready will arrive for the in-flight frame now. Releasing the
-        // un-presented OutputFrame makes its destructor call notifyFrameDropped(),
-        // balancing the RenderLoop's pending-frame count so it does not stall
-        // (the 6.x equivalent of the 5.27 backend's notifyFrameFailed()).
         m_frame.reset();
     }
 
-    // Pause compositing while the consumer is gone: there are no dmabufs to render
-    // into. The bool keeps inhibit/uninhibit balanced (uninhibit() asserts > 0).
     if (!m_renderingInhibited) {
         m_renderLoop->inhibit();
         m_renderingInhibited = true;
@@ -185,9 +181,6 @@ void AnlandOutput::stopRendering()
 
 void AnlandOutput::resumeRendering()
 {
-    // Consumer is back and dmabufs are imported: resume compositing. uninhibit()
-    // reschedules the next repaint internally; the backend then marks the layer
-    // dirty (scheduleRepaint) so the first frame actually paints.
     if (m_renderingInhibited) {
         m_renderLoop->uninhibit();
         m_renderingInhibited = false;
@@ -195,5 +188,3 @@ void AnlandOutput::resumeRendering()
 }
 
 } // namespace KWin
-
-#include "moc_anland_output.cpp"

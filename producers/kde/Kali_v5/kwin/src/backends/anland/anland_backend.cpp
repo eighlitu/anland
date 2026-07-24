@@ -18,20 +18,20 @@
 #include "main.h"
 #include "opengl/egldisplay.h"
 #include "utils/filedescriptor.h"
+#include "utils/pipe.h"
 #include "wayland/abstract_data_source.h"
 #include "wayland/display.h"
 #include "wayland/seat.h"
 #include "wayland_server.h"
 
-#include <QMimeData>
+#include <QFutureWatcher>
 #include <QScopeGuard>
 #include <QSocketNotifier>
-#include <QThreadPool>
 #include <QTimer>
+#include <QtConcurrent>
 
 #include <xf86drm.h>
 
-#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -168,6 +168,8 @@ bool AnlandBackend::initialize()
     // reconnect timer starts and discovers the consumer via try_exit_fallback().
     enterFallback();
 
+    // Connect to KWin's clipboard change signal once.  The handler is guarded
+    // by m_inFallback so it only fires when a consumer is connected.
     if (SeatInterface *seat = waylandServer()->seat()) {
         connect(seat, &SeatInterface::selectionChanged, this, [this](AbstractDataSource *) {
             onClipboardChanged();
@@ -177,7 +179,7 @@ bool AnlandBackend::initialize()
     return true;
 }
 
-std::unique_ptr<OpenGLBackend> AnlandBackend::createOpenGLBackend()
+std::unique_ptr<EglBackend> AnlandBackend::createOpenGLBackend()
 {
     return std::make_unique<AnlandEglBackend>(this);
 }
@@ -192,9 +194,9 @@ QList<CompositingType> AnlandBackend::supportedCompositors() const
     return QList<CompositingType>{OpenGLCompositing};
 }
 
-Outputs AnlandBackend::outputs() const
+QList<BackendOutput *> AnlandBackend::outputs() const
 {
-    Outputs ret;
+    QList<BackendOutput *> ret;
     ret.reserve(m_outputs.size());
     for (AnlandOutput *output : m_outputs) {
         ret.append(output);
@@ -279,15 +281,6 @@ QPointF AnlandBackend::mapInputToLogical(const QPointF &devicePoint) const
     return logical / output->scale();
 }
 
-QPointF AnlandBackend::mapInputDeltaToLogical(const QPointF &deviceDelta) const
-{
-    AnlandOutput *output = m_outputs[0];
-    const OutputTransform transform = output->transform().inverted();
-    const QSizeF bounds = QSizeF(output->modeSize());
-    const QPointF mappedDelta = transform.map(deviceDelta, bounds) - transform.map(QPointF(0, 0), bounds);
-    return mappedDelta / output->scale();
-}
-
 void AnlandBackend::processInputEvent(const InputEvent &ev)
 {
     if (!m_inputDevice) {
@@ -296,8 +289,12 @@ void AnlandBackend::processInputEvent(const InputEvent &ev)
 
     switch (ev.type) {
     case INPUT_TYPE_POINTER_MOTION: {
+        // Both absolute position (x, y) and relative delta (dx, dy) come from the
+        // consumer. Use the same mapInputToLogical for both so that dx/dy delivered
+        // via wl_pointer.relative_motion match the cursor's position space, giving
+        // Wayland clients correct velocity for momentum/kinetic scrolling.
         const QPointF pos = mapInputToLogical(QPointF(ev.pointer_motion.x, ev.pointer_motion.y));
-        const QPointF delta = mapInputDeltaToLogical(QPointF(ev.pointer_motion.dx, ev.pointer_motion.dy));
+        const QPointF delta = mapInputToLogical(QPointF(ev.pointer_motion.dx, ev.pointer_motion.dy));
         m_inputDevice->pointerMotion(pos, delta, delta);
         break;
     }
@@ -336,22 +333,28 @@ void AnlandBackend::processInputEvent(const InputEvent &ev)
         break;
     case INPUT_TYPE_DISPLAY_REFRESH:
         // Not an input event: the consumer reports its live display refresh rate
-        // (mHz) so we can repace the RenderLoop.
+        // (mHz) so we can repace the RenderLoop. m_outputs[0] is valid here (used
+        // for scale above).
         m_outputs[0]->setRefreshRate(static_cast<int>(ev.display.refresh_mhz));
         break;
     case INPUT_TYPE_CLIPBOARD: {
+        // The clipboard event carries the raw text data as inline payload after the
+        // InputEvent header.  ev.clipboard.size tells us how many bytes follow.
         const uint32_t size = ev.clipboard.size;
+        if (size == 0)
+            break;
         QByteArray text(static_cast<int>(size), Qt::Uninitialized);
-        if (size == 0 || poll_input_event_extend_data(m_display, text.data(), size, 5000) == 1) {
+        if (poll_input_event_extend_data(m_display, text.data(), size, 5000) == 1) {
             sendClipboardToKWin(text);
         }
         break;
     }
     case INPUT_TYPE_TEXT_INPUT: {
+        // The text input event carries the raw text data as inline payload after
+        // the InputEvent header.  ev.text_input.size tells us how many bytes follow.
         const uint32_t size = ev.text_input.size;
-        if (size == 0) {
+        if (size == 0)
             break;
-        }
         QByteArray text(static_cast<int>(size), Qt::Uninitialized);
         if (poll_input_event_extend_data(m_display, text.data(), size, 5000) == 1) {
             sendTextInputToKWin(text);
@@ -361,29 +364,34 @@ void AnlandBackend::processInputEvent(const InputEvent &ev)
     case INPUT_TYPE_RESOURCE: {
         // The consumer is handing back the fds for a service we requested. The fdnum
         // fds follow as a separate DATA_MSG_INPUT_EXTEND_FDS message; receive them now
-        // before the next poll_input_event() and route them to the owning engine.
+        // (synchronously, before the next poll_input_event) and route to the engine.
         const uint32_t service = ev.resource.type;
         const uint32_t fdnum = ev.resource.fdnum;
         constexpr int kMaxFds = 1 + 8; // ctrl + up to MAX_CAMERAS streams
-        if (fdnum == 0 || fdnum > kMaxFds) {
+        if (fdnum == 0 || fdnum > kMaxFds)
             break;
-        }
         int fds[kMaxFds];
         int got = 0;
         if (poll_input_event_extend_fds(m_display, fds, static_cast<int>(fdnum), &got, 5000) != 1
             || got < static_cast<int>(fdnum)) {
-            for (int i = 0; i < got; i++) {
+            for (int i = 0; i < got; i++)
                 ::close(fds[i]);
-            }
             break;
         }
         if (service == SERVICE_TYPE_CAMERA) {
             // fds[0] = shared control socket, fds[1..] = per-camera stream sockets.
             anland_camera_set_resources(fds[0], &fds[1], got - 1);
         } else {
-            for (int i = 0; i < got; i++) {
+            for (int i = 0; i < got; i++)
                 ::close(fds[i]);
-            }
+        }
+        break;
+    }
+    case INPUT_TYPE_RESOURCE_INVALID: {
+        const uint32_t service = ev.resource.type;
+        qCWarning(KWIN_ANLAND) << "consumer reported invalid resource for service" << service;
+        if (service == SERVICE_TYPE_CAMERA) {
+            anland_camera_clear();
         }
         break;
     }
@@ -450,8 +458,8 @@ void AnlandBackend::enterFallback()
     // mic Source feeds silence) so PipeWire never perceives the disconnect.
     anland_audio_set_fd(-1);
 
-    // The consumer's camera fds are now dead: stop recording, detach from the
-    // resource fds and let the virtual camera nodes emit blank frames.
+    // The consumer's camera fds are now dead: stop recording, destroy the virtual
+    // camera nodes and close the fds. New ones arrive on the next reconnect.
     anland_camera_clear();
 
     if (m_reconnectTimer) {
@@ -477,8 +485,8 @@ void AnlandBackend::onReconnectTimer()
 
     // try_exit_fallback() already received a fresh dmabuf set. Import it into the
     // layer (which arms an infinite/full-output repaint on every rotation buffer),
-    // resume the RenderLoop (uninhibit, balancing the inhibit from stopRendering),
-    // and mark the layer dirty. addRepaint() keeps the layer's needsRepaint()
+    // resume the RenderLoop (uninhibit, balancing the inhibit from onConsumerLost),
+    // and mark the layer dirty. scheduleRepaint() keeps the layer's needsRepaint()
     // true so the next composite() paints into the new dmabufs even on an idle
     // desktop. resumeRendering() runs unconditionally to keep inhibit/uninhibit
     // balanced regardless of whether the GL layer is attached yet.
@@ -497,11 +505,20 @@ void AnlandBackend::onReconnectTimer()
     push_resources_request(m_display, SERVICE_TYPE_CAMERA, nullptr);
     m_outputs[0]->resumeRendering();
     if (layer) {
-        layer->addRepaint(infiniteRegion());
+        layer->scheduleRepaint(nullptr);
     }
 }
 
-static QByteArray readDataFromFd(FileDescriptor fd)
+// ---------------------------------------------------------------------------
+// Clipboard sync
+// ---------------------------------------------------------------------------
+
+/*
+ * Pipe-based helper: poll() the read-end of a pipe with a timeout, accumulating
+ * data until EOF (the remote side closes its write-end).  Returns the collected
+ * bytes or an empty QByteArray on error / timeout.
+ */
+static QByteArray readDataFromFd(FileDescriptor &fd)
 {
     QByteArray buffer;
     pollfd pfd{};
@@ -511,193 +528,209 @@ static QByteArray readDataFromFd(FileDescriptor fd)
     while (true) {
         const int ready = poll(&pfd, 1, 1000);
         if (ready < 0) {
-            if (errno != EINTR) {
+            if (errno != EINTR)
                 return QByteArray();
-            }
         } else if (ready == 0) {
-            return QByteArray();
+            return QByteArray(); // timeout
         } else {
             char chunk[4096];
             const ssize_t n = read(fd.get(), chunk, sizeof(chunk));
-            if (n < 0) {
+            if (n < 0)
                 return QByteArray();
-            } else if (n == 0) {
+            if (n == 0)
                 return buffer;
-            } else {
-                buffer.append(chunk, n);
-            }
+            buffer.append(chunk, n);
         }
     }
 }
 
-static void writeDataToFd(qint32 rawFd, const QByteArray &buffer)
+/*
+ * Ask a Wayland AbstractDataSource (the clipboard selection) to serve its
+ * text/plain content into a pipe.  Picks text/plain;charset=utf-8 preferentially,
+ * falls back to text/plain.  Returns the pipe's read endpoint that the caller
+ * should drain with readDataFromFd(), or nullopt if nothing useful is available.
+ *
+ * This touches the Wayland server (requestData/flush) and so must run on the
+ * compositor's main thread; the blocking drain of the returned fd can then be
+ * handed off to a worker thread.
+ */
+static std::optional<FileDescriptor> requestClipboardData(AbstractDataSource *source)
 {
-    FileDescriptor fd(rawFd);
-    size_t remaining = buffer.size();
-    pollfd pfd{};
-    pfd.fd = fd.get();
-    pfd.events = POLLOUT;
+    if (!source)
+        return std::nullopt;
 
-    while (remaining > 0) {
-        const int ready = poll(&pfd, 1, 5000);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return;
-        }
-        if (ready == 0 || !(pfd.revents & POLLOUT)) {
-            return;
-        }
-
-        const char *chunk = buffer.constData() + (buffer.size() - remaining);
-        const ssize_t n = write(fd.get(), chunk, remaining);
-        if (n <= 0) {
-            return;
-        }
-        remaining -= n;
-    }
-}
-
-static QByteArray requestClipboardText(AbstractDataSource *source)
-{
-    if (!source) {
-        return QByteArray();
-    }
-
-    const QStringList mimeTypes = source->mimeTypes();
+    const QStringList types = source->mimeTypes();
     QString mimeType;
-    if (mimeTypes.contains(QStringLiteral("text/plain;charset=utf-8"))) {
+    if (types.contains(QStringLiteral("text/plain;charset=utf-8")))
         mimeType = QStringLiteral("text/plain;charset=utf-8");
-    } else if (mimeTypes.contains(QStringLiteral("text/plain"))) {
+    else if (types.contains(QStringLiteral("text/plain")))
         mimeType = QStringLiteral("text/plain");
-    } else {
-        return QByteArray();
-    }
+    else
+        return std::nullopt; // no text type available
 
-    int pipeFds[2];
-    if (pipe2(pipeFds, O_CLOEXEC) != 0) {
-        return QByteArray();
-    }
+    std::optional<Pipe> pipe = Pipe::create(O_CLOEXEC);
+    if (!pipe)
+        return std::nullopt;
 
-    source->requestData(mimeType, pipeFds[1]);
+    source->requestData(mimeType, std::move(pipe->writeEndpoint));
     waylandServer()->display()->flush();
-    return readDataFromFd(FileDescriptor(pipeFds[0]));
+    return std::move(pipe->readEndpoint);
 }
 
+/*
+ * Called whenever KWin's SeatInterface::selectionChanged fires.
+ * Reads the new clipboard content and pushes it to the consumer.
+ * De-duplicates: if the text is identical to the last known value, the
+ * send is skipped (avoids the consumer re-posting the same text back to KWin).
+ */
 void AnlandBackend::onClipboardChanged()
 {
-    if (m_inFallback) {
+    if (m_inFallback)
         return;
-    }
 
     AbstractDataSource *source = waylandServer()->seat()->selection();
-    if (source == m_clipboardSource.get()) {
+    std::optional<FileDescriptor> readFd = requestClipboardData(source);
+    if (!readFd)
         return;
-    }
+    // Draining the pipe can block for up to a second waiting for the owning
+    // client to serve the data. Do it on a worker thread so the compositor's
+    // main loop never stalls, then deliver the result back here.
+    auto *watcher = new QFutureWatcher<QByteArray>(this);
+    connect(watcher, &QFutureWatcher<QByteArray>::finished, this, [this, watcher]() {
+        watcher->deleteLater();
+        if (m_inFallback)
+            return;
 
-    const QByteArray text = requestClipboardText(source);
-    if (text == m_clipboardText) {
-        return;
-    }
+        const QByteArray text = watcher->result();
+        if (text == m_clipboardText)
+            return; // already in sync
 
-    m_clipboardText = text;
-    sendClipboardToConsumer(text);
+        m_clipboardText = text;
+        sendClipboardToConsumer(text);
+    });
+    watcher->setFuture(QtConcurrent::run([fd = std::move(*readFd)]() mutable {
+        return readDataFromFd(fd);
+    }));
 }
 
+/*
+ * Push clipboard text to the Android consumer via the data channel.
+ * Uses the variable-length INPUT_TYPE_CLIPBOARD event (header + raw UTF-8).
+ * An empty text clears the remote clipboard.
+ */
 void AnlandBackend::sendClipboardToConsumer(const QByteArray &text)
 {
-    if (m_inFallback) {
+    if (m_inFallback)
         return;
-    }
 
     const uint32_t len = static_cast<uint32_t>(text.size());
     const OutputEvent ev = {
         .type = OUTPUT_TYPE_CLIPBOARD,
         .clipboard = { .size = len },
     };
-    push_output_event_with_length(m_display, &ev, const_cast<char *>(text.constData()), len);
+    push_output_event_with_length(m_display, &ev,
+                                  const_cast<char *>(text.constData()), len);
 }
 
+/*
+ * Called from processInputEvent() when the consumer pushes clipboard data to us.
+ * Reads the trailing payload, then sets the KWin Wayland selection to that text
+ * so all Wayland clients see the change.
+ * De-duplicates: if the incoming text matches our m_clipboardText, we skip the
+ * setSelection() call to avoid a feedback loop.
+ */
 void AnlandBackend::sendClipboardToKWin(const QByteArray &text)
 {
-    if (text == m_clipboardText) {
-        return;
-    }
+    if (text == m_clipboardText)
+        return; // already in sync — skip to break the loop
 
     m_clipboardText = text;
 
-    if (!waylandServer()) {
+    if (!waylandServer())
         return;
-    }
 
     SeatInterface *seat = waylandServer()->seat();
-    if (!seat) {
+    if (!seat)
         return;
-    }
 
-    if (text.isEmpty()) {
-        seat->setSelection(nullptr, waylandServer()->display()->nextSerial());
-        m_clipboardSource.reset();
-        return;
-    }
+    // Build a minimal QMimeData + AbstractDataSource to feed setSelection().
+    // The source wraps the data; setSelection() tells all wl_data_device listeners
+    // about the new clipboard content.
+    auto *mimeData = new QMimeData();
+    mimeData->setData(QStringLiteral("text/plain;charset=utf-8"), text);
 
-    class AnlandClipboardSource : public AbstractDataSource
-    {
+    // ClipboardDataSource lives in the QPA plugin namespace; re-create the same
+    // pattern inline since it is a trivial AbstractDataSource subclass.
+    class AnlandClipboardSource : public AbstractDataSource {
     public:
-        explicit AnlandClipboardSource(std::unique_ptr<QMimeData> data, QObject *parent = nullptr)
-            : AbstractDataSource(parent)
-            , m_data(std::move(data))
+        explicit AnlandClipboardSource(QMimeData *data, QObject *parent = nullptr)
+            : AbstractDataSource(parent), m_data(data) {}
+        void requestData(const QString &mimeType, FileDescriptor fd) override
         {
-        }
-
-        void requestData(const QString &mimeType, qint32 fd) override
-        {
-            const QByteArray data = m_data->data(mimeType);
-            QThreadPool::globalInstance()->start([data, fd]() {
-                writeDataToFd(fd, data);
+            const QByteArray buf = m_data->data(mimeType);
+            // Write asynchronously — the read side is blocked until EOF.
+            QtConcurrent::run([buf, fd = std::move(fd)]() mutable {
+                size_t remaining = buf.size();
+                const char *ptr = buf.constData();
+                pollfd pfd{};
+                pfd.fd = fd.get();
+                pfd.events = POLLOUT;
+                while (remaining > 0) {
+                    if (poll(&pfd, 1, 5000) <= 0)
+                        break;
+                    if (!(pfd.revents & POLLOUT))
+                        break;
+                    ssize_t n = write(fd.get(), ptr, remaining);
+                    if (n <= 0)
+                        break;
+                    ptr += n;
+                    remaining -= n;
+                }
             });
         }
-
-        void cancel() override
-        {
-        }
-
-        QStringList mimeTypes() const override
-        {
-            return m_data->formats();
-        }
-
+        void cancel() override {}
+        QStringList mimeTypes() const override { return m_data->formats(); }
     private:
-        std::unique_ptr<QMimeData> m_data;
+        QMimeData *m_data;
     };
 
-    auto mimeData = std::make_unique<QMimeData>();
-    mimeData->setData(QStringLiteral("text/plain;charset=utf-8"), text);
-    mimeData->setData(QStringLiteral("text/plain"), text);
-
-    auto oldSource = std::move(m_clipboardSource);
-    m_clipboardSource = std::make_unique<AnlandClipboardSource>(std::move(mimeData));
-    seat->setSelection(m_clipboardSource.get(), waylandServer()->display()->nextSerial());
-    oldSource.reset();
+    auto *source = new AnlandClipboardSource(mimeData, mimeData);
+    seat->setSelection(source, waylandServer()->display()->nextSerial());
+    // seat->setSelection() takes a raw pointer; it is released when the next
+    // selection replaces it, or when the seat is torn down.  We parent the source
+    // to mimeData so it is freed when mimeData goes away — but since setSelection()
+    // holds a raw pointer, keep both alive for the lifetime of the seat's selection.
+    // Parent the source to the seat to ensure it outlives the selection reference.
+    source->setParent(seat);
 }
 
+// ---------------------------------------------------------------------------
+// Text input
+// ---------------------------------------------------------------------------
+
+/*
+ * Inject UTF-8 text the consumer's IME committed into the focused KWin client.
+ *
+ * The pipeline is IME -> compositor -> app. The consumer's Android keyboard is
+ * the IME; this hands the committed text to KWin's InputMethod at exactly the
+ * point a zwp_input_method_v1 commit_string arrives (InputMethod::commitText ->
+ * commitString). KWin then owns delivery: to the focused text-input client
+ * (text-input v1/v2/v3, carrying CJK / emoji) or as synthesized key events when
+ * the client has no text-input interface. We deliberately do not write to the
+ * client's text-input ourselves — this code is not the compositor's IME router.
+ */
 void AnlandBackend::sendTextInputToKWin(const QByteArray &text)
 {
-    if (m_inFallback) {
+    if (m_inFallback)
         return;
-    }
 
-    const QString string = QString::fromUtf8(text);
-    if (string.isEmpty()) {
+    const QString str = QString::fromUtf8(text);
+    if (str.isEmpty())
         return;
-    }
 
-    if (InputMethod *inputMethod = kwinApp()->inputMethod()) {
-        inputMethod->commitText(string);
+    if (InputMethod *im = kwinApp()->inputMethod()) {
+        im->commitText(str);
     }
 }
 
 } // namespace KWin
-
-#include "moc_anland_backend.cpp"

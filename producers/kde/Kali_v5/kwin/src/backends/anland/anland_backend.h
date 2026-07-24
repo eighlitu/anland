@@ -31,11 +31,11 @@ namespace KWin
 
 class AnlandOutput;
 class AnlandInputDevice;
-class AbstractDataSource;
+class BackendOutput;
 class DrmDevice;
+class EglBackend;
 class EglDisplay;
 class InputBackend;
-class OpenGLBackend;
 
 class KWIN_EXPORT AnlandBackend : public OutputBackend
 {
@@ -47,13 +47,11 @@ public:
 
     bool initialize() override;
 
-    std::unique_ptr<OpenGLBackend> createOpenGLBackend() override;
+    std::unique_ptr<EglBackend> createOpenGLBackend() override;
     std::unique_ptr<InputBackend> createInputBackend() override;
     QList<CompositingType> supportedCompositors() const override;
-    Outputs outputs() const override;
+    QList<BackendOutput *> outputs() const override;
 
-    // 6.x stores the scene EGL display on the output backend; the EGL render
-    // backend creates it (surfaceless) and hands it over via setEglDisplay().
     EglDisplay *sceneEglDisplayObject() const override;
     void setEglDisplay(std::unique_ptr<EglDisplay> &&display);
 
@@ -61,11 +59,6 @@ public:
     {
         return m_display;
     }
-    /**
-     * DRM render device backing GL/EGL. KWin dereferences this during OpenGL
-     * compositor setup (syncobj-timeline / dmabuf-feedback probing), so it must
-     * be non-null; AnlandEglBackend::drmDevice() forwards to it.
-     */
     DrmDevice *drmDevice() const
     {
         return m_drmDevice.get();
@@ -75,19 +68,15 @@ public:
         return m_inputDevice.get();
     }
 
-    /**
-     * Called by AnlandEglBackend::present(): hand the freshly painted buffer to
-     * the consumer (signals the render-done fence channel). Returns true if the buffer was
-     * actually handed over (consumer was ready), false otherwise — the caller
-     * uses this to decide how to complete the RenderLoop frame.
-     */
     bool notifyFramePresented();
 
     /** Re-run the Workspace output layout after an output changed its mode at
      *  runtime (AnlandOutput::resize). The backend mutates the mode directly via
-     *  setState() instead of going through OutputConfiguration, so it must emit
-     *  outputsQueried() itself; the mode-changed signal alone does not trigger a
-     *  relayout. */
+     *  setState() instead of going through OutputConfiguration, so — exactly like
+     *  DrmBackend/VirtualBackend do after altering their output set — it must emit
+     *  outputsQueried() itself. Otherwise Workspace::updateOutputs() never runs and
+     *  windows keep their old geometry (the mode-changed signal alone does not
+     *  trigger a relayout). */
     void notifyOutputsChanged()
     {
         Q_EMIT outputsQueried();
@@ -100,13 +89,15 @@ private:
     void onBufferReady();
     void processInputEvent(const InputEvent &ev);
     QPointF mapInputToLogical(const QPointF &devicePoint) const;
-    QPointF mapInputDeltaToLogical(const QPointF &deviceDelta) const;
     void onReconnectTimer();
     void enterFallback();
 
+    // Clipboard sync — bidirectional bridge between KWin selection / consumer
     void onClipboardChanged();
     void sendClipboardToConsumer(const QByteArray &text);
     void sendClipboardToKWin(const QByteArray &text);
+
+    // Inject UTF-8 text from the consumer's IME into the focused KWin client.
     void sendTextInputToKWin(const QByteArray &text);
 
     static void fallbackTrampoline(void *data);
@@ -125,8 +116,11 @@ private:
 
     bool m_consumerReady = false;
     bool m_inFallback = false;
+
+    // Last known clipboard text — used to de-duplicate (KWin changed -> we sent ->
+    // consumer sets the same text on Android -> consumer sends back to KWin).
+    // QByteArray is trivially sent over the data channel as UTF-8.
     QByteArray m_clipboardText;
-    std::unique_ptr<AbstractDataSource> m_clipboardSource;
 };
 
 } // namespace KWin

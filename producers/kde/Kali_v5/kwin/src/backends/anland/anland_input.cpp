@@ -98,10 +98,10 @@ void AnlandInputDevice::pointerMotionAbsolute(const QPointF &position)
     Q_EMIT InputDevice::pointerFrame(this);
 }
 
-void AnlandInputDevice::pointerMotion(const QPointF &position, const QPointF &delta, const QPointF &deltaNonAccelerated)
+void AnlandInputDevice::pointerMotion(const QPointF &pos, const QPointF &delta, const QPointF &deltaUnaccel)
 {
-    Q_EMIT InputDevice::pointerMotionAbsolute(position, now(), this);
-    Q_EMIT InputDevice::pointerMotion(delta, deltaNonAccelerated, now(), this);
+    Q_EMIT InputDevice::pointerMotionAbsolute(pos, now(), this);
+    Q_EMIT InputDevice::pointerMotion(delta, deltaUnaccel, now(), this);
     Q_EMIT InputDevice::pointerFrame(this);
 }
 
@@ -168,5 +168,3 @@ void AnlandInputBackend::initialize()
 }
 
 } // namespace KWin
-
-#include "moc_anland_input.cpp"

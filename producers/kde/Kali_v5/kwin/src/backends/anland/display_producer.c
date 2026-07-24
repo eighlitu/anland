@@ -76,7 +76,7 @@ static void enter_fallback(display_ctx *ctx)
 /*
  * Ask the daemon for the consumer-side fds and map the shm index. Polls ctrl_fd
  * with a short timeout so it returns promptly when no consumer is up yet. On
- * success the five fds and shm_ptr are installed on ctx; the caller releases them
+ * success the four fds and shm_ptr are installed on ctx; the caller releases them
  * via release_consumer_resources() on any later failure. Returns 0 / -1.
  */
 static int pickup_fds(display_ctx *ctx)
@@ -265,7 +265,13 @@ int trigger_refresh(display_ctx *ctx)
      * (producer->consumer). The message itself is the "frame rendered" signal -- no
      * separate eventfd, no cross-channel ordering. The render fence rides as
      * SCM_RIGHTS ancillary data when we have one; otherwise a bare byte is sent so
-     * the consumer's per-frame recv always has exactly one message. */
+     * the consumer's per-frame recv always has exactly one message (it then queues
+     * with -1). The consumer hands the fence to queueBuffer -> SurfaceFlinger waits
+     * GPU-side. NON-BLOCKING: this runs on kwin's main thread, which must never block
+     * on our socket. In lockstep the consumer always drains, so the one-message
+     * buffer never fills; a momentary miss self-heals via the consumer's 5s
+     * poll->fallback rather than freezing the compositor. data_fd's reverse direction
+     * is intentionally left unused (reserved for future extension). */
     char b = 0;
     struct iovec iov = { .iov_base = &b, .iov_len = 1 };
     union {
@@ -324,7 +330,6 @@ int poll_input_event(display_ctx *ctx, struct InputEvent *event, int timeout_ms)
     memcpy(event, msg_buf + sizeof(struct data_msg), sizeof(*event));
     return 1;
 }
-
 int poll_input_event_extend_fds(display_ctx *ctx, int *fds, int max_fds,
                                 int *fd_count, int timeout_ms)
 {
@@ -389,24 +394,18 @@ int push_output_event(display_ctx *ctx, const struct OutputEvent *event)
     }
     return 0;
 }
-
-int push_output_event_with_length(display_ctx *ctx, const struct OutputEvent *event, void *payload, size_t size)
+int push_output_event_with_length(display_ctx *ctx, const struct OutputEvent *event, void* payload, size_t size)
 {
     if (ctx->fallback)
         return 0;
 
     struct data_msg hdr = { .type = DATA_MSG_OUTPUT_EVENT, .size = sizeof(struct OutputEvent) };
-    const size_t msg_size = sizeof(struct data_msg) + sizeof(struct OutputEvent) + size;
-    uint8_t *msg = malloc(msg_size);
-    if (!msg)
-        return -1;
-
+    uint8_t *msg = (uint8_t *)malloc(sizeof(struct data_msg) + sizeof(struct OutputEvent) + size);
     memcpy(msg, &hdr, sizeof(hdr));
     memcpy(msg + sizeof(hdr), event, sizeof(*event));
-    if (size > 0)
-        memcpy(msg + sizeof(hdr) + sizeof(struct OutputEvent), payload, size);
+    memcpy(msg + sizeof(hdr) + sizeof(struct OutputEvent), payload, size);
 
-    if (send_all(ctx->data_fd, msg, msg_size) < 0) {
+    if (send_all(ctx->data_fd, msg, sizeof(struct data_msg) + sizeof(struct OutputEvent) + size) < 0) {
         free(msg);
         enter_fallback(ctx);
         return -1;
@@ -414,8 +413,7 @@ int push_output_event_with_length(display_ctx *ctx, const struct OutputEvent *ev
     free(msg);
     return 0;
 }
-
-int poll_input_event_extend_data(display_ctx *ctx, void *payload, size_t size, int timeout_ms)
+int poll_input_event_extend_data(display_ctx *ctx, void* payload, size_t size, int timeout_ms)
 {
     if (ctx->fallback)
         return 0;
@@ -433,7 +431,6 @@ int poll_input_event_extend_data(display_ctx *ctx, void *payload, size_t size, i
         return -1;
     return 1;
 }
-
 int set_fallback_callback(display_ctx *ctx, void (*on_fallback)(void *), void *userdata)
 {
     ctx->fallback_cb = on_fallback;

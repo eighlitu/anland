@@ -12,11 +12,10 @@
 // kwin
 #include "core/graphicsbuffer.h" // DmaBufAttributes
 #include "core/output.h" // OutputTransform
-#include "opengl/eglcontext.h"
 #include "opengl/egldisplay.h"
+#include "opengl/eglcontext.h"
 #include "opengl/eglnativefence.h"
 #include "opengl/glutils.h"
-#include "platformsupport/scenes/opengl/basiceglsurfacetexture_wayland.h"
 #include "utils/filedescriptor.h"
 
 #include <drm_fourcc.h>
@@ -46,14 +45,16 @@ static uint32_t protocol_format_to_drm(uint32_t fmt)
 }
 
 AnlandEglLayer::AnlandEglLayer(AnlandOutput *output, AnlandEglBackend *backend)
-    : OutputLayer(output)
+    : OutputLayer(output, OutputLayerType::Primary)
     , m_backend(backend)
     , m_output(output)
     , m_display(backend->display())
 {
-    // React to runtime orientation changes through the output's transformChanged
-    // signal instead of polling the transform in the per-frame render path.
-    connect(m_output, &Output::transformChanged, this, &AnlandEglLayer::onOutputTransformChanged);
+    // React to runtime orientation changes (System Settings / kscreen-doctor)
+    // through the output's transformChanged signal instead of polling the transform
+    // in the per-frame render path. Qt drops the connection automatically when this
+    // layer (a QObject via OutputLayer) or the output is destroyed.
+    connect(m_output, &BackendOutput::transformChanged, this, &AnlandEglLayer::onOutputTransformChanged);
 }
 
 AnlandEglLayer::~AnlandEglLayer()
@@ -70,26 +71,36 @@ void AnlandEglLayer::releaseBuffers()
 {
     // Destroying the GL textures/framebuffers needs the context current. Callers
     // (backend state machine on fallback, ~AnlandEglLayer) may run outside a frame.
-    m_backend->makeCurrent();
+    m_backend->openglContext()->makeCurrent();
 
     for (int i = 0; i < MAX_BUFS; i++) {
         m_fbos[i].reset();
         m_textures[i].reset();
-        m_accumDamage[i] = QRegion();
+        m_renderTargets[i].reset();
+        m_accumDamage[i] = Region();
     }
+    m_damageFlags = 0;
+    m_damageMask = 0;
     m_bufCount = 0;
 }
 
 bool AnlandEglLayer::importBuffers(int count)
 {
-    m_backend->makeCurrent();
+    m_backend->openglContext()->makeCurrent();
 
     releaseBuffers();
 
     // The consumer reads this dmabuf top-down, while GL renders bottom-up, so the
     // content transform always carries a vertical flip. On top of that we fold in
     // the output's configured rotation, so the scene is rendered pre-rotated into
-    // the consumer's fixed-size dmabuf.
+    // the (fixed-size, landscape) dmabuf — that is what lets the very same buffer
+    // drive a portrait / 180° display. KWin's renderer (RenderTarget/RenderViewport)
+    // bakes this single transform into the root projection with no extra copy; it is
+    // the official 6.x replacement for the old GLFramebuffer::setYInverted() flag the
+    // 5.27 patch carried. Combining the output rotation with FlipY mirrors the DRM
+    // backend exactly (drmOutput()->transform().combine(OutputTransform::FlipY)).
+    // The tag is sticky on each texture; after import it is only ever updated
+    // reactively, in onOutputTransformChanged().
     const OutputTransform contentTransform = m_output->transform().combine(OutputTransform::FlipY);
 
     for (int i = 0; i < count; i++) {
@@ -103,8 +114,9 @@ bool AnlandEglLayer::importBuffers(int count)
 
         /* The per-buffer width/height come from the consumer's native resolution
          * (buf_info, filled by collect_dmabufs). If it differs from the current
-         * OutputMode, resize the output to match. All buffers in a set share the
-         * same size, so we only need to check the first buffer. */
+         * OutputMode, resize the output to match — the consumer may have rotated or
+         * switched display modes. All buffers in a set share the same size, so we
+         * only need to check the first buffer. */
         if (i == 0) {
             const QSize bufSize(info.width, info.height);
             if (bufSize != m_output->modeSize() && bufSize.isValid()) {
@@ -149,11 +161,14 @@ bool AnlandEglLayer::importBuffers(int count)
 
         m_textures[i] = std::move(texture);
         m_fbos[i] = std::move(fbo);
+        m_renderTargets[i].emplace(m_fbos[i].get());
         // Freshly imported dmabuf has undefined contents: owe it a full repaint.
-        m_accumDamage[i] = infiniteRegion();
+        m_accumDamage[i] = Region::infinite();
     }
 
     m_bufCount = count;
+    m_damageMask = (uint8_t)((1 << m_bufCount) - 1);
+    m_damageFlags = m_damageMask;
     return true;
 }
 
@@ -162,67 +177,47 @@ void AnlandEglLayer::onOutputTransformChanged()
     const OutputTransform contentTransform = m_output->transform().combine(OutputTransform::FlipY);
     for (int i = 0; i < m_bufCount; i++) {
         m_textures[i]->setContentTransform(contentTransform);
-        m_accumDamage[i] = infiniteRegion();
+        // The cached RenderTarget captured the old transform; rebuild it so the
+        // renderer picks up the new content transform on the next doBeginFrame.
+        m_renderTargets[i].emplace(m_fbos[i].get());
+        m_accumDamage[i] = Region::infinite();
     }
-    addRepaint(infiniteRegion());
+    m_damageFlags = m_damageMask;
+    scheduleRepaint(nullptr);
 }
 
 std::optional<OutputLayerBeginFrameInfo> AnlandEglLayer::doBeginFrame()
 {
-    m_backend->makeCurrent();
-
-    // Buffer import/release is driven by the backend state machine (importBuffers()
-    // on reconnect, releaseBuffers() on fallback), not here. With nothing imported
-    // there is no dmabuf to render into.
-    if (m_bufCount == 0) {
-        return std::nullopt;
-    }
+    m_backend->openglContext()->makeCurrent();
 
     m_currentIndex = get_selected_idx(m_display);
-    if (m_currentIndex < 0 || m_currentIndex >= m_bufCount) {
-        m_currentIndex = 0;
-    }
 
     return OutputLayerBeginFrameInfo{
-        .renderTarget = RenderTarget(m_fbos[m_currentIndex].get()),
+        .renderTarget = *m_renderTargets[m_currentIndex],
         .repaint = m_accumDamage[m_currentIndex],
     };
 }
 
-bool AnlandEglLayer::doEndFrame(const QRegion &renderedDeviceRegion, const QRegion &damagedDeviceRegion, OutputFrame *frame)
+bool AnlandEglLayer::doEndFrame(const Region &renderedDeviceRegion, const Region &damagedDeviceRegion, OutputFrame *frame)
 {
     glFlush(); // flush pending rendering commands into the dmabuf.
-    // Every buffer owes this frame's damage; the buffer we just painted is now
-    // fully up to date, so clear its debt.
-    for (int i = 0; i < m_bufCount; i++) {
+    for (int i = 0; i < m_bufCount; i++)
         m_accumDamage[i] = m_accumDamage[i] + damagedDeviceRegion;
-    }
-    if (m_currentIndex < m_bufCount) {
-        m_accumDamage[m_currentIndex] = QRegion();
-    }
 
-    // KWin's OutputLayer::needsRepaint() reflects only scene damage; it knows
-    // nothing about our external buffer rotation. When the scene goes momentarily
-    // idle, the compositor would skip rendering (needsRepaint() == false) yet
-    // still present() — handing the consumer whichever buffer it just rotated to,
-    // which still owes earlier frames' damage -> stale "dirty buffer" flicker /
-    // cursor jitter. So while ANY buffer still owes damage, schedule our own
-    // repaint: that keeps needsRepaint() true so the
-    // compositor keeps rendering and catches each rotated buffer up. It stops
-    // on its own once every buffer's debt is cleared (idle scene adds no new
-    // damage), so there is no busy-loop.
-    for (int i = 0; i < m_bufCount; i++) {
-        if (!m_accumDamage[i].isEmpty()) {
-            addRepaint(infiniteRegion());
-            break;
-        }
-    }
+    if (!damagedDeviceRegion.isEmpty())
+        m_damageFlags = m_damageMask;
+
+    m_accumDamage[m_currentIndex] = Region();
+    
+    m_damageFlags &= ~(uint8_t)(1 << m_currentIndex);
+    if (m_damageFlags != 0)
+        scheduleRepaint(nullptr);
 
     // Instead of CPU-blocking on glFinish, create a fence for the just-submitted
-    // GPU work and hand it to the consumer. The consumer passes it to
-    // ANativeWindow_queueBuffer, so SurfaceFlinger waits on it GPU-side before
-    // scanout.
-    EGLNativeFence fence{m_backend->eglDisplayObject()};
+    // GPU work and hand it to the consumer (via the transport). The consumer passes
+    // it to ANativeWindow_queueBuffer, so SurfaceFlinger waits on it GPU-side before
+    // scanout -- letting us submit the buffer before its render completes.
+    EGLNativeFence fence{m_backend->openglContext()->displayObject()};
     set_render_fence(m_display, fence.takeFileDescriptor().take());
     return true;
 }
@@ -237,14 +232,8 @@ QHash<uint32_t, QList<uint64_t>> AnlandEglLayer::supportedDrmFormats() const
     return {};
 }
 
-std::shared_ptr<GLTexture> AnlandEglLayer::texture() const
-{
-    return m_textures[m_currentIndex];
-}
-
 AnlandEglBackend::AnlandEglBackend(AnlandBackend *b)
-    : AbstractEglBackend()
-    , m_backend(b)
+    : m_backend(b)
 {
 }
 
@@ -300,11 +289,10 @@ void AnlandEglBackend::init()
         return;
     }
 
-    setSupportsBufferAge(false);
     initWayland();
 
     const auto outputs = m_backend->outputs();
-    for (Output *output : outputs) {
+    for (BackendOutput *output : outputs) {
         addOutput(output);
     }
 
@@ -314,12 +302,12 @@ void AnlandEglBackend::init()
 
 bool AnlandEglBackend::initRenderingContext()
 {
-    return createContext(EGL_NO_CONFIG_KHR) && makeCurrent();
+    return createContext(EGL_NO_CONFIG_KHR) && openglContext()->makeCurrent();
 }
 
-void AnlandEglBackend::addOutput(Output *output)
+void AnlandEglBackend::addOutput(BackendOutput *output)
 {
-    makeCurrent();
+    openglContext()->makeCurrent();
     auto *anlandOutput = static_cast<AnlandOutput *>(output);
     auto layer = std::make_unique<AnlandEglLayer>(anlandOutput, this);
     // Let AnlandBackend reach this layer through its output (output->eglLayer()).
@@ -327,42 +315,20 @@ void AnlandEglBackend::addOutput(Output *output)
     m_outputs[output] = std::move(layer);
 }
 
-void AnlandEglBackend::removeOutput(Output *output)
+void AnlandEglBackend::removeOutput(BackendOutput *output)
 {
-    makeCurrent();
+    openglContext()->makeCurrent();
     static_cast<AnlandOutput *>(output)->setEglLayer(nullptr);
     m_outputs.erase(output);
 }
 
-std::unique_ptr<SurfaceTexture> AnlandEglBackend::createSurfaceTextureWayland(SurfacePixmap *pixmap)
-{
-    return std::make_unique<BasicEGLSurfaceTextureWayland>(this, pixmap);
-}
-
-OutputLayer *AnlandEglBackend::primaryLayer(Output *output)
+QList<OutputLayer *> AnlandEglBackend::compatibleOutputLayers(BackendOutput *output)
 {
     auto it = m_outputs.find(output);
     if (it == m_outputs.end()) {
-        return nullptr;
+        return {};
     }
-    return it->second.get();
-}
-
-bool AnlandEglBackend::present(Output *output, const std::shared_ptr<OutputFrame> &frame)
-{
-    static_cast<AnlandOutput *>(output)->present(frame);
-    return true;
-}
-
-std::pair<std::shared_ptr<KWin::GLTexture>, ColorDescription> AnlandEglBackend::textureForOutput(Output *output) const
-{
-    auto it = m_outputs.find(output);
-    if (it == m_outputs.end()) {
-        return {nullptr, ColorDescription::sRGB};
-    }
-    return {it->second->texture(), ColorDescription::sRGB};
+    return {it->second.get()};
 }
 
 } // namespace KWin
-
-#include "moc_anland_egl_backend.cpp"

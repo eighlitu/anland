@@ -15,12 +15,13 @@
 #pragma once
 
 #include "core/outputlayer.h"
-#include "platformsupport/scenes/opengl/abstract_egl_backend.h"
+#include "core/region.h"
+#include "opengl/eglbackend.h"
 
-#include <QRegion>
 #include <array>
 #include <map>
 #include <memory>
+#include <optional>
 
 extern "C" {
 #include "display_producer.h"
@@ -31,11 +32,9 @@ namespace KWin
 {
 class GLFramebuffer;
 class GLTexture;
+class BackendOutput;
 class DrmDevice;
 class OutputFrame;
-class Output;
-class SurfacePixmap;
-class SurfaceTexture;
 class AnlandBackend;
 class AnlandEglBackend;
 class AnlandOutput;
@@ -47,42 +46,30 @@ public:
     ~AnlandEglLayer() override;
 
     std::optional<OutputLayerBeginFrameInfo> doBeginFrame() override;
-    bool doEndFrame(const QRegion &renderedDeviceRegion, const QRegion &damagedDeviceRegion, OutputFrame *frame) override;
-
-    // OutputLayer pure virtuals. anland imports the consumer's dmabufs and
-    // never allocates or scans out through DRM itself, so these are stubs.
+    bool doEndFrame(const Region &renderedDeviceRegion, const Region &damagedDeviceRegion, OutputFrame *frame) override;
     DrmDevice *scanoutDevice() const override;
     QHash<uint32_t, QList<uint64_t>> supportedDrmFormats() const override;
-
-    // Buffer lifetime is driven by the backend state machine, not doBeginFrame():
-    // importBuffers() imports the daemon's dmabuf set on (re)connect and arms a
-    // full-output (infinite) repaint on every rotation buffer; releaseBuffers()
-    // drops them on fallback. Both make
-    // the GL context current, so they are safe to call from outside a frame.
     bool importBuffers(int count);
-    void releaseBuffers();
-    std::shared_ptr<GLTexture> texture() const;
+    void releaseBuffers() override;
 
 private:
     void onOutputTransformChanged();
 
     AnlandEglBackend *const m_backend;
     AnlandOutput *m_output;
-    // Cached producer handle (stable for the backend's lifetime); avoids the
-    // m_backend->display() forwarding chain on every doBeginFrame().
     display_ctx *const m_display;
 
     int m_bufCount = 0;
     int m_currentIndex = 0;
+    uint8_t m_damageFlags = 0;
+    uint8_t m_damageMask = 0;
     std::array<std::shared_ptr<GLTexture>, MAX_BUFS> m_textures;
     std::array<std::unique_ptr<GLFramebuffer>, MAX_BUFS> m_fbos;
-    /* Per-buffer accumulated damage: each buffer must remember everything that
-     * changed since it was last rendered, because the consumer rotates the
-     * selected index out from under us. */
-    std::array<QRegion, MAX_BUFS> m_accumDamage;
+    std::array<std::optional<RenderTarget>, MAX_BUFS> m_renderTargets;
+    std::array<Region, MAX_BUFS> m_accumDamage;
 };
 
-class AnlandEglBackend : public AbstractEglBackend
+class AnlandEglBackend : public EglBackend
 {
     Q_OBJECT
 
@@ -91,10 +78,7 @@ public:
     ~AnlandEglBackend() override;
 
     void init() override;
-    std::unique_ptr<SurfaceTexture> createSurfaceTextureWayland(SurfacePixmap *pixmap) override;
-    std::pair<std::shared_ptr<KWin::GLTexture>, ColorDescription> textureForOutput(Output *output) const override;
-    OutputLayer *primaryLayer(Output *output) override;
-    bool present(Output *output, const std::shared_ptr<OutputFrame> &frame) override;
+    QList<OutputLayer *> compatibleOutputLayers(BackendOutput *output) override;
     DrmDevice *drmDevice() const override;
 
     AnlandBackend *backend() const
@@ -107,11 +91,11 @@ private:
     bool initializeEgl();
     bool initRenderingContext();
 
-    void addOutput(Output *output);
-    void removeOutput(Output *output);
+    void addOutput(BackendOutput *output);
+    void removeOutput(BackendOutput *output);
 
     AnlandBackend *m_backend;
-    std::map<Output *, std::unique_ptr<AnlandEglLayer>> m_outputs;
+    std::map<BackendOutput *, std::unique_ptr<AnlandEglLayer>> m_outputs;
 };
 
 } // namespace KWin
