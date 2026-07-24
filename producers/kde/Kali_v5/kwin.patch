@@ -57,7 +57,7 @@ diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
  
  InputMethod::InputMethod()
 @@ -566,6 +555,76 @@
-     waylandServer()->seat()->notifyKeyboardKey(keysymToKeycode(sym), state);
+     waylandServer()->seat()->notifyKeyboardKey(keysymToKeycode(sym), state, waylandServer()->seat()->nextSerial());
  }
  
 +void InputMethod::commitText(const QString &text)
@@ -112,22 +112,24 @@ diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
 +    }
 +
 +    keyboard->setKeymap(temporaryKeymap);
-+    waylandServer()->seat()->notifyKeyboardKey(syntheticKeyCode, KeyboardKeyState::Pressed);
-+    waylandServer()->seat()->notifyKeyboardKey(syntheticKeyCode, KeyboardKeyState::Released);
++    const uint32_t serial = waylandServer()->seat()->nextSerial();
++    waylandServer()->seat()->notifyKeyboardKey(syntheticKeyCode, KeyboardKeyState::Pressed, serial);
++    waylandServer()->seat()->notifyKeyboardKey(syntheticKeyCode, KeyboardKeyState::Released, serial);
 +    keyboard->setKeymap(input()->keyboard()->xkb()->keymapContents());
 +}
 +
 +void InputMethod::forwardKeySym(int keySym)
 +{
-+    const std::optional<std::pair<int, int>> keyCode = input()->keyboard()->xkb()->keycodeFromKeysym(keySym);
-+    if (!keyCode || keyCode->second > 0) {
++    const auto keyCode = input()->keyboard()->xkb()->keycodeFromKeysym(keySym);
++    if (!keyCode.has_value()) {
 +        sendKeySymWithTemporaryKeymap(keySym);
 +        return;
 +    }
 +
-+    const quint32 key = keyCode->first;
-+    waylandServer()->seat()->notifyKeyboardKey(key, KeyboardKeyState::Pressed);
-+    waylandServer()->seat()->notifyKeyboardKey(key, KeyboardKeyState::Released);
++    const quint32 key = static_cast<quint32>(*keyCode);
++    const uint32_t serial = waylandServer()->seat()->nextSerial();
++    waylandServer()->seat()->notifyKeyboardKey(key, KeyboardKeyState::Pressed, serial);
++    waylandServer()->seat()->notifyKeyboardKey(key, KeyboardKeyState::Released, serial);
 +}
 +
  void InputMethod::commitString(qint32 serial, const QString &text)
