@@ -42,8 +42,7 @@ static void sendKeySymWithTemporaryKeymap(xkb_keysym_t keySym)
         return;
     }
     keyboard->setKeymap(temporaryKeymap);
-    const uint32_t serial = waylandServer()->seat()->nextSerial();
-    waylandServer()->seat()->notifyKeyboardKey(syntheticKeyCode, KeyboardKeyState::Pressed, serial);
-    waylandServer()->seat()->notifyKeyboardKey(syntheticKeyCode, KeyboardKeyState::Released, serial);
+    waylandServer()->seat()->notifyKeyboardKey(syntheticKeyCode, KeyboardKeyState::Pressed, 0);
+    waylandServer()->seat()->notifyKeyboardKey(syntheticKeyCode, KeyboardKeyState::Released, 0);
     keyboard->setKeymap(input()->keyboard()->xkb()->keymapContents());
 }
