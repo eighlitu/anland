@@ -108,6 +108,27 @@ build_pkg() {
         cp -a "$overlay_dir/." "$tree/"
     fi
 
+    # ---- Kali KWin: inject anland inputmethod functions before commitString ----
+    if [ "$src" = "kwin" ]; then
+        local im_cpp="$tree/src/inputmethod.cpp"
+        local im_anland="$SCRIPT_DIR/inputmethod_anland.cpp"
+        [ -f "$im_cpp" ]     || die "cannot find inputmethod.cpp at $im_cpp"
+        [ -f "$im_anland" ]  || die "cannot find inputmethod_anland.cpp at $im_anland"
+        local marker='void InputMethod::commitString'
+        if ! grep -qF "$marker" "$im_cpp"; then
+            die "commitString marker not found in inputmethod.cpp"
+        fi
+        log "Injecting anland inputmethod functions before commitString"
+        local line
+        line="$(grep -nF "$marker" "$im_cpp" | head -1 | cut -d: -f1)"
+        head -n $((line - 1)) "$im_cpp"         >  "${im_cpp}.tmp"
+        cat "$im_anland"                        >> "${im_cpp}.tmp"
+        echo ""                                 >> "${im_cpp}.tmp"
+        tail -n "+$line" "$im_cpp"              >> "${im_cpp}.tmp"
+        mv "${im_cpp}.tmp" "$im_cpp"
+        log "Anland inputmethod functions injected"
+    fi
+
     log "Applying patch: $patch -> $tree"
     if ( cd "$tree" && patch -p1 --forward --reject-file=- < "$patch" ); then
         :
