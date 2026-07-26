@@ -8,6 +8,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.hardware.display.DisplayManager;
 import android.content.SharedPreferences;
@@ -83,10 +84,11 @@ public class MainActivity extends Activity
     // (no pipeline was ever initialized). Makes onPause/onResume no-op-and-exit.
     private boolean mForceSettings = false;
     private static final String KEY_ACCESSIBILITY_ENABLED = "accessibility_key_intercept";
-    private static final String KEY_EXTRA_KEYS_ENABLED = "extra_keys_bar";
-    private static final String KEY_AUTO_SHOW_EXTRA_KEYS = "auto_show_extra_keys";
+    private static final String KEY_EXTRA_KEYS_MODE = "extra_keys_mode";
     private static final String KEY_BACK_OPENS_EXTRA_KEYS = "back_opens_extra_keys";
     private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
+    // Linux input-event-codes.h: KEY_BACK (the browser-back key).
+    private static final int EVDEV_BROWSER_BACK = 158;
     // When on, the IME and extra-keys bar float over the display instead of
     // shrinking it: the bar rides up with the keyboard but the surface keeps
     // its full size. See relayout() and buildExtraKeysBar().
@@ -278,6 +280,8 @@ public class MainActivity extends Activity
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        applyOrientation();
 
         // Apply the launch parameters: socket path (overrides the saved pref) and
         // window name (task title). Read them before anything else so the dedup
@@ -733,23 +737,29 @@ public class MainActivity extends Activity
     
         mImeBottom = newImeBottom;
     
-        if (imeVisible != wasImeVisible)
-            setExtraKeysBarVisible(shouldShowBar(imeVisible));
+        // Only "with_keyboard" mode tracks the IME; "always"/"never"
+        // let the user's manual toggle (back key) stay untouched.
+        String mode = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getString(KEY_EXTRA_KEYS_MODE, "always");
+        if (imeVisible != wasImeVisible && "with_keyboard".equals(mode))
+            setExtraKeysBarVisible(imeVisible);
 
         relayout();
     }
 
-    // Desired extra-keys bar visibility for the current keyboard state. The two
-    // switches are independent: with "auto-show" ON the bar tracks the keyboard
-    // (regardless of the master switch), so it appears whenever the IME opens —
-    // including via the bound virtual-keyboard key, the app's only other opener.
-    // With "auto-show" OFF the master switch keeps the bar persistently visible.
+    // Desired extra-keys bar visibility for the current keyboard state. The
+    // single three-way preference replaces the old two-switch pair:
+    //   "always"       – bar always visible
+    //   "never"        – bar always hidden
+    //   "with_keyboard" – bar tracks the soft keyboard (default)
     private boolean shouldShowBar(boolean imeVisible) {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        boolean autoShow = prefs.getBoolean(KEY_AUTO_SHOW_EXTRA_KEYS, true);
-        if (autoShow)
-            return imeVisible;
-        return prefs.getBoolean(KEY_EXTRA_KEYS_ENABLED, false);
+        String mode = prefs.getString(KEY_EXTRA_KEYS_MODE, "always");
+        switch (mode) {
+            case "always":   return true;
+            case "never":    return false;
+            default:         return imeVisible;
+        }
     }
 
     // Recompute the surface bottom margin and the bar position from the current
@@ -847,6 +857,23 @@ public class MainActivity extends Activity
         setExtraKeysBarVisible(!visible);
     }
 
+    // Apply the screen-orientation preference (default / landscape / portrait).
+    private void applyOrientation() {
+        String mode = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getString("screen_orientation", "default");
+        switch (mode) {
+            case "landscape":
+                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+                break;
+            case "portrait":
+                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT);
+                break;
+            default:
+                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+                break;
+        }
+    }
+
     // ---- SystemIME.Host ----
 
     @Override
@@ -858,7 +885,10 @@ public class MainActivity extends Activity
     // callback may not fire, so sync the extra-keys bar explicitly here in all modes.
     @Override
     public void onImeVisibilityChanged(boolean visible) {
-        setExtraKeysBarVisible(shouldShowBar(visible));
+        String mode = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getString(KEY_EXTRA_KEYS_MODE, "always");
+        if ("with_keyboard".equals(mode))
+            setExtraKeysBarVisible(visible);
     }
 
     // ================================================================
@@ -953,17 +983,30 @@ public class MainActivity extends Activity
         if (event.getRepeatCount() > 0)
             return true;
 
-        return forwardKeyToLinux(event);
+        // Some tablet keyboard layouts expose their physical Esc key as
+        // Android Back (Linux KEY_BACK / Browser Back).  Convert it only on
+        // the accessibility-interception path so the normal Android Back and
+        // extra-keys-bar behaviour is unchanged when interception is off.
+        return forwardKeyToLinux(event, true);
     }
 
     private boolean forwardKeyToLinux(KeyEvent event) {
+        return forwardKeyToLinux(event, false);
+    }
+
+    private boolean forwardKeyToLinux(KeyEvent event, boolean convertBackToEscape) {
         int keyCode = event.getKeyCode();
         int action = event.getAction() == KeyEvent.ACTION_DOWN ? 0 : 1;
         int evdev = -1;
 
+        if (convertBackToEscape
+                && (keyCode == KeyEvent.KEYCODE_BACK
+                    || event.getScanCode() == EVDEV_BROWSER_BACK))
+            evdev = KeyCodeMapper.getScanCode(KeyEvent.KEYCODE_ESCAPE);
+
         // Reserved Android keys may carry vendor scan codes that Linux does not
         // recognize, so prefer their explicit evdev mapping.
-        if (shouldPreferMappedKey(keyCode))
+        if (evdev == -1 && shouldPreferMappedKey(keyCode))
             evdev = KeyCodeMapper.getScanCode(keyCode);
 
         if (evdev == -1 && event.getScanCode() != 0)
