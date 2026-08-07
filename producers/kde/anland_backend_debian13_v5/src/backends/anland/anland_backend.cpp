@@ -22,6 +22,8 @@
 #include "wayland/display.h"
 #include "wayland/seat.h"
 #include "wayland_server.h"
+#include "window.h"
+#include "workspace.h"
 
 #include <QMimeData>
 #include <QScopeGuard>
@@ -81,6 +83,11 @@ static std::unique_ptr<DrmDevice> openRenderDevice()
     return DrmDevice::open(QStringLiteral("/dev/dri/renderD128"));
 }
 
+static void detachAudioBeforeConsumerRelease(void *)
+{
+    anland_audio_set_fd(-1);
+}
+
 AnlandBackend::AnlandBackend(const QString &socketPath, QObject *parent)
     : OutputBackend(parent)
     , m_socketPath(socketPath.isEmpty() ? s_defaultSocketPath : socketPath)
@@ -115,6 +122,7 @@ bool AnlandBackend::initialize()
         return false;
     }
 
+    set_pre_release_callback(m_display, detachAudioBeforeConsumerRelease, nullptr);
     set_fallback_callback(m_display, &AnlandBackend::fallbackTrampoline, this);
 
     uint32_t w = 0, h = 0, fmt = 0, refresh = 0;
@@ -172,6 +180,16 @@ bool AnlandBackend::initialize()
         connect(seat, &SeatInterface::selectionChanged, this, [this](AbstractDataSource *) {
             onClipboardChanged();
         });
+    }
+
+    // Pointer-lock tracking for CONSUMER_VAR_CAPTURE_MOUSE. The Workspace is created
+    // after the backend initializes (see ApplicationWayland::performStartup), so wire
+    // the window-activation trigger when workspaceCreated fires; if the workspace is
+    // already up (defensive), start immediately.
+    if (workspace()) {
+        setupMouseCaptureTracking();
+    } else {
+        connect(kwinApp(), &Application::workspaceCreated, this, &AnlandBackend::setupMouseCaptureTracking);
     }
 
     return true;
@@ -446,9 +464,8 @@ void AnlandBackend::enterFallback()
     m_consumerReady = false;
     m_inFallback = true;
 
-    // Detach the audio socket: the streams keep running (capture drops its PCM, the
-    // mic Source feeds silence) so PipeWire never perceives the disconnect.
-    anland_audio_set_fd(-1);
+    // Audio is already detached: startup has no consumer socket, and a consumer
+    // loss detaches the source before display_producer closes its borrowed fd.
 
     // The consumer's camera fds are now dead: stop recording, detach from the
     // resource fds and let the virtual camera nodes emit blank frames.
@@ -499,6 +516,105 @@ void AnlandBackend::onReconnectTimer()
     if (layer) {
         layer->addRepaint(infiniteRegion());
     }
+
+    // The consumer regresses every var to 0 on its own fallback, so the data
+    // channel coming back up means we must re-assert the current pointer-capture
+    // override (a game may still hold its pointer lock across the reconnect).
+    sendConsumerVar(CONSUMER_VAR_CAPTURE_MOUSE, m_captureMouseActive ? 1 : 0);
+}
+
+void AnlandBackend::setupMouseCaptureTracking()
+{
+    // Window activation is the cross-window trigger: a newly focused window may
+    // carry (or release) its own pointer lock. Per-surface and per-lock signals
+    // are wired lazily inside updateMouseCaptureVar() as the focused surface and
+    // its lock identity change.
+    if (auto *ws = workspace()) {
+        connect(ws, &Workspace::windowActivated, this, &AnlandBackend::updateMouseCaptureVar);
+        updateMouseCaptureVar();
+    }
+}
+
+void AnlandBackend::updateMouseCaptureVar()
+{
+    // Re-derive the active pointer constraint from the focused window, rewiring
+    // signals only when the surface / constraint identity changes. This mirrors
+    // the triggers KWin itself uses in PointerInputRedirection::updatePointerConstraints()
+    // (window activation + SurfaceInterface::pointerConstraintsChanged + each
+    // constraint's own lockedChanged/confinedChanged), so we observe
+    // zwp_locked_pointer_v1 and zwp_confined_pointer_v1 enable/disable without
+    // touching core input code. The lock covers native pointer lock plus Xwayland's
+    // hidden-cursor+confine emulation; the confine covers Xwayland visible-cursor
+    // confine and native confinement. The QPointers auto-null on destruction and Qt
+    // auto-clears connections to a destroyed QObject, so re-derivation stays safe.
+    SurfaceInterface *surface = nullptr;
+    if (auto *window = workspace()->activeWindow()) {
+        surface = window->surface();
+    }
+
+    if (surface != m_captureMouseSurface.data()) {
+        QObject::disconnect(m_captureMouseSurfaceConn);
+        m_captureMouseSurfaceConn = QMetaObject::Connection();
+        m_captureMouseSurface = surface;
+        if (surface) {
+            // Fires when a lock is installed on / removed from this surface, so we
+            // pick up a freshly created zwp_locked_pointer_v1 (and its later removal).
+            m_captureMouseSurfaceConn = connect(surface, &SurfaceInterface::pointerConstraintsChanged,
+                                                this, &AnlandBackend::updateMouseCaptureVar);
+        }
+    }
+
+    LockedPointerV1Interface *lock = surface ? surface->lockedPointer() : nullptr;
+    if (lock != m_captureMouseLock.data()) {
+        QObject::disconnect(m_captureMouseLockConn);
+        m_captureMouseLockConn = QMetaObject::Connection();
+        m_captureMouseLock = lock;
+        if (lock) {
+            // Fires when KWin activates/deactivates the lock (setLocked(true/false)).
+            m_captureMouseLockConn = connect(lock, &LockedPointerV1Interface::lockedChanged,
+                                             this, &AnlandBackend::updateMouseCaptureVar);
+        }
+    }
+
+    // Xwayland exposes an X11 confine_to grab as a confined pointer (visible
+    // cursor) or, when the cursor is hidden, upgrades it to a lock above; native
+    // clients may also confine. Either an active lock or an active confinement
+    // means the focused client has trapped the pointer, so both force capture.
+    ConfinedPointerV1Interface *confined = surface ? surface->confinedPointer() : nullptr;
+    if (confined != m_captureMouseConfined.data()) {
+        QObject::disconnect(m_captureMouseConfinedConn);
+        m_captureMouseConfinedConn = QMetaObject::Connection();
+        m_captureMouseConfined = confined;
+        if (confined) {
+            // Fires when KWin activates/deactivates the confinement
+            // (setConfined(true/false)).
+            m_captureMouseConfinedConn = connect(confined, &ConfinedPointerV1Interface::confinedChanged,
+                                                 this, &AnlandBackend::updateMouseCaptureVar);
+        }
+    }
+
+    const bool captureActive = (lock && lock->isLocked())
+                            || (confined && confined->isConfined());
+    if (captureActive != m_captureMouseActive) {
+        m_captureMouseActive = captureActive;
+        sendConsumerVar(CONSUMER_VAR_CAPTURE_MOUSE, captureActive ? 1 : 0);
+    }
+}
+
+void AnlandBackend::sendConsumerVar(uint32_t var, uint32_t value)
+{
+    if (m_inFallback) {
+        // No consumer connected. m_captureMouseActive still tracks the desired
+        // state; the value is force-resent from onReconnectTimer() once the data
+        // channel comes back up.
+        return;
+    }
+
+    const OutputEvent ev = {
+        .type = OUTPUT_TYPE_SET_CONSUMER_VAR,
+        .set_consumer_var = { .var = var, .value = value },
+    };
+    push_output_event(m_display, &ev);
 }
 
 static QByteArray readDataFromFd(FileDescriptor fd)
